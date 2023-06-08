@@ -1,0 +1,7 @@
+Truck
+Pkw
+bus
+truck_trail
+van_trail
+cam
+pkw_trail
