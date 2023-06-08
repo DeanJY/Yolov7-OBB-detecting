@@ -1,396 +1,359 @@
-import colorsys
-import os
-import time
-
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import ImageDraw, ImageFont
 
-from nets.yolo import YoloBody
-from utils.utils import (cvtColor, get_anchors, get_classes, preprocess_input,
-                         resize_image, show_config)
-from utils.utils_bbox import DecodeBox
-from utils.utils_rbox import *
-'''
-训练自己的数据集必看注释！
-'''
-class YOLO(object):
-    _defaults = {
-        #--------------------------------------------------------------------------#
-        #   使用自己训练好的模型进行预测一定要修改model_path和classes_path！
-        #   model_path指向logs文件夹下的权值文件，classes_path指向model_data下的txt
-        #
-        #   训练好后logs文件夹下存在多个权值文件，选择验证集损失较低的即可。
-        #   验证集损失较低不代表mAP较高，仅代表该权值在验证集上泛化性能较好。
-        #   如果出现shape不匹配，同时要注意训练时的model_path和classes_path参数的修改
-        #--------------------------------------------------------------------------#
-        #"model_path"        : 'logs/best_epoch_weights.pth',
-        "model_path"        : 'logs/ep100-loss0.034-val_loss0.035.pth',
-        "classes_path"      : 'model_data/voc_classes.txt',
-        #---------------------------------------------------------------------#
-        #   anchors_path代表先验框对应的txt文件，一般不修改。
-        #   anchors_mask用于帮助代码找到对应的先验框，一般不修改。
-        #---------------------------------------------------------------------#
-        "anchors_path"      : 'model_data/yolo_anchors.txt',
-        "anchors_mask"      : [[6, 7, 8], [3, 4, 5], [0, 1, 2]],
-        #---------------------------------------------------------------------#
-        #   输入图片的大小，必须为32的倍数。
-        #---------------------------------------------------------------------#
-        "input_shape"       : [640, 640],
-        #"input_shape"       : [3200, 3200], 
-        #------------------------------------------------------#
-        #   所使用到的yolov7的版本，本仓库一共提供两个：
-        #   l : 对应yolov7
-        #   x : 对应yolov7_x
-        #------------------------------------------------------#
-        "phi"               : 'l',
-        #---------------------------------------------------------------------#
-        #   只有得分大于置信度的预测框会被保留下来
-        #---------------------------------------------------------------------#
-        "confidence"        : 0.5,
-        #---------------------------------------------------------------------#
-        #   非极大抑制所用到的nms_iou大小
-        #---------------------------------------------------------------------#
-        "nms_iou"           : 0.3,
-        #---------------------------------------------------------------------#
-        #   该变量用于控制是否使用letterbox_image对输入图像进行不失真的resize，
-        #   在多次测试后，发现关闭letterbox_image直接resize的效果更好
-        #---------------------------------------------------------------------#
-        "letterbox_image"   : True,
-        #-------------------------------#
-        #   是否使用Cuda
-        #   没有GPU可以设置成False
-        #-------------------------------#
-        "cuda"              : False,
-    }
+from nets.backbone import Backbone, Multi_Concat_Block, Conv, SiLU, Transition_Block, autopad
 
-    @classmethod
-    def get_defaults(cls, n):
-        if n in cls._defaults:
-            return cls._defaults[n]
+
+class SPPCSPC(nn.Module):
+    # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
+        super(SPPCSPC, self).__init__()
+        c_ = int(2 * c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(c_, c_, 3, 1)
+        self.cv4 = Conv(c_, c_, 1, 1)
+        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+        self.cv5 = Conv(4 * c_, c_, 1, 1)
+        self.cv6 = Conv(c_, c_, 3, 1)
+        # 输出通道数为c2
+        self.cv7 = Conv(2 * c_, c2, 1, 1)
+
+    def forward(self, x):
+        x1 = self.cv4(self.cv3(self.cv1(x)))
+        y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+        y2 = self.cv2(x)
+        return self.cv7(torch.cat((y1, y2), dim=1))
+
+class RepConv(nn.Module):
+    # Represented convolution
+    # https://arxiv.org/abs/2101.03697
+    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=SiLU(), deploy=False):
+        super(RepConv, self).__init__()
+        self.deploy         = deploy
+        self.groups         = g
+        self.in_channels    = c1
+        self.out_channels   = c2
+        
+        assert k == 3
+        assert autopad(k, p) == 1
+
+        padding_11  = autopad(k, p) - k // 2
+        self.act    = nn.LeakyReLU(0.1, inplace=True) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+        if deploy:
+            self.rbr_reparam    = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
         else:
-            return "Unrecognized attribute name '" + n + "'"
+            self.rbr_identity   = (nn.BatchNorm2d(num_features=c1, eps=0.001, momentum=0.03) if c2 == c1 and s == 1 else None)
+            self.rbr_dense      = nn.Sequential(
+                nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2, eps=0.001, momentum=0.03),
+            )
+            self.rbr_1x1        = nn.Sequential(
+                nn.Conv2d( c1, c2, 1, s, padding_11, groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2, eps=0.001, momentum=0.03),
+            )
 
-    #---------------------------------------------------#
-    #   初始化YOLO
-    #---------------------------------------------------#
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)
-            self._defaults[name] = value 
-            
-        #---------------------------------------------------#
-        #   获得种类和先验框的数量
-        #---------------------------------------------------#
-        self.class_names, self.num_classes  = get_classes(self.classes_path)
-        self.anchors, self.num_anchors      = get_anchors(self.anchors_path)
-        self.bbox_util                      = DecodeBox(self.anchors, self.num_classes, (self.input_shape[0], self.input_shape[1]), self.anchors_mask)
-        #---------------------------------------------------#
-        #   画框设置不同的颜色
-        #---------------------------------------------------#
-        hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
-        self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-        self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
-        self.generate()
+    def forward(self, inputs):
+        if hasattr(self, "rbr_reparam"):
+            return self.act(self.rbr_reparam(inputs))
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+    
+    def get_equivalent_kernel_bias(self):
+        kernel3x3, bias3x3  = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1  = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid    = self._fuse_bn_tensor(self.rbr_identity)
+        return (
+            kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid,
+            bias3x3 + bias1x1 + biasid,
+        )
 
-        show_config(**self._defaults)
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        else:
+            return nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
-    #---------------------------------------------------#
-    #   生成模型
-    #---------------------------------------------------#
-    def generate(self, onnx=False):
-        #---------------------------------------------------#
-        #   建立yolo模型，载入yolo模型的权重
-        #---------------------------------------------------#
-        self.net    = YoloBody(self.anchors_mask, self.num_classes, self.phi)
-        device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net.load_state_dict(torch.load(self.model_path, map_location=device))
-        self.net    = self.net.fuse().eval()
-        print('{} model, and classes loaded.'.format(self.model_path))
-        if not onnx:
-            if self.cuda:
-                self.net = nn.DataParallel(self.net)
-                self.net = self.net.cuda()
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return 0, 0
+        if isinstance(branch, nn.Sequential):
+            kernel      = branch[0].weight
+            running_mean = branch[1].running_mean
+            running_var = branch[1].running_var
+            gamma       = branch[1].weight
+            beta        = branch[1].bias
+            eps         = branch[1].eps
+        else:
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, "id_tensor"):
+                input_dim = self.in_channels // self.groups
+                kernel_value = np.zeros(
+                    (self.in_channels, input_dim, 3, 3), dtype=np.float32
+                )
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
+            kernel      = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma       = branch.weight
+            beta        = branch.bias
+            eps         = branch.eps
+        std = (running_var + eps).sqrt()
+        t   = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
 
-    #---------------------------------------------------#
-    #   检测图片
-    #---------------------------------------------------#
-    def detect_image(self, image, crop = False, count = False):
-        #---------------------------------------------------#
-        #   计算输入图片的高和宽
-        #---------------------------------------------------#
-        image_shape = np.array(np.shape(image)[0:2])
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #   h, w, 3 => 3, h, w => 1, 3, h, w
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+    def repvgg_convert(self):
+        kernel, bias = self.get_equivalent_kernel_bias()
+        return (
+            kernel.detach().cpu().numpy(),
+            bias.detach().cpu().numpy(),
+        )
 
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs = self.net(images)
-            outputs = self.bbox_util.decode_box(outputs)
-            #---------------------------------------------------------#
-            #   将预测框进行堆叠，然后进行非极大抑制
-            #---------------------------------------------------------#
-            results = self.bbox_util.non_max_suppression(torch.cat(outputs, 1), self.num_classes, self.input_shape, 
-                        image_shape, self.letterbox_image, conf_thres = self.confidence, nms_thres = self.nms_iou)
-                                                    
-            if results[0] is None: 
-                return image
+    def fuse_conv_bn(self, conv, bn):
+        std     = (bn.running_var + bn.eps).sqrt()
+        bias    = bn.bias - bn.running_mean * bn.weight / std
 
-            top_label   = np.array(results[0][:, 7], dtype = 'int32')
-            top_conf    = results[0][:, 5] * results[0][:, 6]
-            top_rboxes  = results[0][:, :5] #xc yc w h an
-            top_polys   = rbox2poly(top_rboxes)
-            print("roboxes",top_rboxes)
-            print("polys",top_polys)
-        #---------------------------------------------------------#
-        #   设置字体与边框厚度
-        #---------------------------------------------------------#
-        font        = ImageFont.truetype(font='model_data/simhei.ttf', size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
-        thickness   = int(max((image.size[0] + image.size[1]) // np.mean(self.input_shape), 1))
-        #---------------------------------------------------------#
-        #   计数
-        #---------------------------------------------------------#
-        if count:
-            print("top_label:", top_label)
-            classes_nums    = np.zeros([self.num_classes])
-            for i in range(self.num_classes):
-                num = np.sum(top_label == i)
-                if num > 0:
-                    print(self.class_names[i], " : ", num)
-                classes_nums[i] = num
-            print("classes_nums:", classes_nums)
-        #---------------------------------------------------------#
-        #   图像绘制
-        #---------------------------------------------------------#
-        for i, c in list(enumerate(top_label)):
-            predicted_class = self.class_names[int(c)]
-            poly            = top_polys[i].astype(np.int32)
-            score           = top_conf[i]
+        t       = (bn.weight / std).reshape(-1, 1, 1, 1)
+        weights = conv.weight * t
 
-            polygon_list = list(poly)
-            label = '{} {:.2f}'.format(predicted_class, score)
-            draw = ImageDraw.Draw(image)
-            label_size = draw.textsize(label, font)
-            label = label.encode('utf-8')
-            print(label, polygon_list)
-            
-            text_origin = np.array([poly[0], poly[1]], np.int32)
+        bn      = nn.Identity()
+        conv    = nn.Conv2d(in_channels = conv.in_channels,
+                              out_channels = conv.out_channels,
+                              kernel_size = conv.kernel_size,
+                              stride=conv.stride,
+                              padding = conv.padding,
+                              dilation = conv.dilation,
+                              groups = conv.groups,
+                              bias = True,
+                              padding_mode = conv.padding_mode)
 
-            draw.polygon(xy=polygon_list, outline=self.colors[c])
-            draw.text(text_origin, str(label,'UTF-8'), fill=self.colors[c], font=font)
-            del draw
+        conv.weight = torch.nn.Parameter(weights)
+        conv.bias   = torch.nn.Parameter(bias)
+        return conv
 
-        return image
-
-    def get_FPS(self, image, test_interval):
-        image_shape = np.array(np.shape(image)[0:2])
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs = self.net(images)
-            outputs = self.bbox_util.decode_box(outputs)
-            #---------------------------------------------------------#
-            #   将预测框进行堆叠，然后进行非极大抑制
-            #---------------------------------------------------------#
-            results = self.bbox_util.non_max_suppression(torch.cat(outputs, 1), self.num_classes, self.input_shape, 
-                        image_shape, self.letterbox_image, conf_thres=self.confidence, nms_thres=self.nms_iou)
-                                                    
-        t1 = time.time()
-        for _ in range(test_interval):
-            with torch.no_grad():
-                #---------------------------------------------------------#
-                #   将图像输入网络当中进行预测！
-                #---------------------------------------------------------#
-                outputs = self.net(images)
-                outputs = self.bbox_util.decode_box(outputs)
-                #---------------------------------------------------------#
-                #   将预测框进行堆叠，然后进行非极大抑制
-                #---------------------------------------------------------#
-                results = self.bbox_util.non_max_suppression(torch.cat(outputs, 1), self.num_classes, self.input_shape, 
-                            image_shape, self.letterbox_image, conf_thres=self.confidence, nms_thres=self.nms_iou)
-                            
-        t2 = time.time()
-        tact_time = (t2 - t1) / test_interval
-        return tact_time
-
-    def detect_heatmap(self, image, heatmap_save_path):
-        import cv2
-        import matplotlib.pyplot as plt
-        def sigmoid(x):
-            y = 1.0 / (1.0 + np.exp(-x))
-            return y
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1],self.input_shape[0]), self.letterbox_image)
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs = self.net(images)
+    def fuse_repvgg_block(self):    
+        if self.deploy:
+            return
+        print(f"RepConv.fuse_repvgg_block")
+        self.rbr_dense  = self.fuse_conv_bn(self.rbr_dense[0], self.rbr_dense[1])
         
-        plt.imshow(image, alpha=1)
-        plt.axis('off')
-        mask    = np.zeros((image.size[1], image.size[0]))
-        for sub_output in outputs:
-            sub_output = sub_output.cpu().numpy()
-            b, c, h, w = np.shape(sub_output)
-            sub_output = np.transpose(np.reshape(sub_output, [b, 3, -1, h, w]), [0, 3, 4, 1, 2])[0]
-            score      = np.max(sigmoid(sub_output[..., 4]), -1)
-            score      = cv2.resize(score, (image.size[0], image.size[1]))
-            normed_score    = (score * 255).astype('uint8')
-            mask            = np.maximum(mask, normed_score)
-            
-        plt.imshow(mask, alpha=0.5, interpolation='nearest', cmap="jet")
-
-        plt.axis('off')
-        plt.subplots_adjust(top=1, bottom=0, right=1,  left=0, hspace=0, wspace=0)
-        plt.margins(0, 0)
-        plt.savefig(heatmap_save_path, dpi=200, bbox_inches='tight', pad_inches = -0.1)
-        print("Save to the " + heatmap_save_path)
-        plt.show()
-
-    def convert_to_onnx(self, simplify, model_path):
-        import onnx
-        self.generate(onnx=True)
-
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
-        input_layer_names   = ["images"]
-        output_layer_names  = ["output"]
+        self.rbr_1x1    = self.fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1])
+        rbr_1x1_bias    = self.rbr_1x1.bias
+        weight_1x1_expanded = torch.nn.functional.pad(self.rbr_1x1.weight, [1, 1, 1, 1])
         
-        # Export the model
-        print(f'Starting export with onnx {onnx.__version__}.')
-        torch.onnx.export(self.net,
-                        im,
-                        f               = model_path,
-                        verbose         = False,
-                        opset_version   = 12,
-                        training        = torch.onnx.TrainingMode.EVAL,
-                        do_constant_folding = True,
-                        input_names     = input_layer_names,
-                        output_names    = output_layer_names,
-                        dynamic_axes    = None)
+        # Fuse self.rbr_identity
+        if (isinstance(self.rbr_identity, nn.BatchNorm2d) or isinstance(self.rbr_identity, nn.modules.batchnorm.SyncBatchNorm)):
+            identity_conv_1x1 = nn.Conv2d(
+                    in_channels=self.in_channels,
+                    out_channels=self.out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=self.groups, 
+                    bias=False)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.to(self.rbr_1x1.weight.data.device)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.squeeze().squeeze()
+            identity_conv_1x1.weight.data.fill_(0.0)
+            identity_conv_1x1.weight.data.fill_diagonal_(1.0)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.unsqueeze(2).unsqueeze(3)
 
-        # Checks
-        model_onnx = onnx.load(model_path)  # load onnx model
-        onnx.checker.check_model(model_onnx)  # check onnx model
+            identity_conv_1x1           = self.fuse_conv_bn(identity_conv_1x1, self.rbr_identity)
+            bias_identity_expanded      = identity_conv_1x1.bias
+            weight_identity_expanded    = torch.nn.functional.pad(identity_conv_1x1.weight, [1, 1, 1, 1])            
+        else:
+            bias_identity_expanded      = torch.nn.Parameter( torch.zeros_like(rbr_1x1_bias) )
+            weight_identity_expanded    = torch.nn.Parameter( torch.zeros_like(weight_1x1_expanded) )            
+        
+        self.rbr_dense.weight   = torch.nn.Parameter(self.rbr_dense.weight + weight_1x1_expanded + weight_identity_expanded)
+        self.rbr_dense.bias     = torch.nn.Parameter(self.rbr_dense.bias + rbr_1x1_bias + bias_identity_expanded)
+                
+        self.rbr_reparam    = self.rbr_dense
+        self.deploy         = True
 
-        # Simplify onnx
-        if simplify:
-            import onnxsim
-            print(f'Simplifying with onnx-simplifier {onnxsim.__version__}.')
-            model_onnx, check = onnxsim.simplify(
-                model_onnx,
-                dynamic_input_shape=False,
-                input_shapes=None)
-            assert check, 'assert check failed'
-            onnx.save(model_onnx, model_path)
+        if self.rbr_identity is not None:
+            del self.rbr_identity
+            self.rbr_identity = None
 
-        print('Onnx model save as {}'.format(model_path))
+        if self.rbr_1x1 is not None:
+            del self.rbr_1x1
+            self.rbr_1x1 = None
 
-    def get_map_txt(self, image_id, image, class_names, map_out_path):
-        f = open(os.path.join(map_out_path, "detection-results/"+image_id+".txt"), "w", encoding='utf-8') 
-        image_shape = np.array(np.shape(image)[0:2])
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+        if self.rbr_dense is not None:
+            del self.rbr_dense
+            self.rbr_dense = None
+            
+def fuse_conv_and_bn(conv, bn):
+    fusedconv = nn.Conv2d(conv.in_channels,
+                          conv.out_channels,
+                          kernel_size=conv.kernel_size,
+                          stride=conv.stride,
+                          padding=conv.padding,
+                          groups=conv.groups,
+                          bias=True).requires_grad_(False).to(conv.weight.device)
 
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs = self.net(images)
-            outputs = self.bbox_util.decode_box(outputs)
-            #---------------------------------------------------------#
-            #   将预测框进行堆叠，然后进行非极大抑制
-            #---------------------------------------------------------#
-            results = self.bbox_util.non_max_suppression(torch.cat(outputs, 1), self.num_classes, self.input_shape, 
-                        image_shape, self.letterbox_image, conf_thres = self.confidence, nms_thres = self.nms_iou)
-                                                    
-            if results[0] is None: 
-                return 
+    w_conv  = conv.weight.clone().view(conv.out_channels, -1)
+    w_bn    = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+    # fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
+    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape).detach())
 
-            top_label   = np.array(results[0][:, 7], dtype = 'int32')
-            top_conf    = results[0][:, 5] * results[0][:, 6]
-            top_rboxes  = results[0][:, :5] #xc，yc,w,h,theta
-        for i, c in list(enumerate(top_label)):
-            predicted_class = self.class_names[int(c)]
-            obb             = top_rboxes[i]
-            score           = str(top_conf[i])
+    b_conv  = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
+    b_bn    = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+    # fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+    fusedconv.bias.copy_((torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn).detach())
+    return fusedconv
 
-            xc, yc, w, h, angle = obb
+#---------------------------------------------------#
+#   yolo_body
+#---------------------------------------------------#
+class YoloBody(nn.Module):
+    def __init__(self, anchors_mask, num_classes, phi, pretrained=False):
+        super(YoloBody, self).__init__()
+        #-----------------------------------------------#
+        #   定义了不同yolov7版本的参数
+        #-----------------------------------------------#
+        transition_channels = {'l' : 32, 'x' : 40}[phi]
+        block_channels      = 32
+        panet_channels      = {'l' : 32, 'x' : 64}[phi]
+        e       = {'l' : 2, 'x' : 1}[phi]
+        n       = {'l' : 4, 'x' : 6}[phi]
+        ids     = {'l' : [-1, -2, -3, -4, -5, -6], 'x' : [-1, -3, -5, -7, -8]}[phi]
+        conv    = {'l' : RepConv, 'x' : Conv}[phi]
+        #-----------------------------------------------#
+        #   输入图片是640, 640, 3
+        #-----------------------------------------------#
 
-            if predicted_class not in class_names:
-                continue
+        #---------------------------------------------------#   
+        #   生成主干模型
+        #   获得三个有效特征层，他们的shape分别是：
+        #   80, 80, 512
+        #   40, 40, 1024
+        #   20, 20, 1024
+        #---------------------------------------------------#
+        self.backbone   = Backbone(transition_channels, block_channels, n, phi, pretrained=pretrained)
 
-            f.write("%s %s %s %s %s %s %s\n" % (predicted_class, score[:6], str(int(xc)), str(int(yc)), str(int(w)), str(int(h)), str(math.degrees(angle))))
+        #------------------------加强特征提取网络------------------------# 
+        self.upsample   = nn.Upsample(scale_factor=2, mode="nearest")
 
-        f.close()
-        return 
+        # 20, 20, 1024 => 20, 20, 512
+        self.sppcspc                = SPPCSPC(transition_channels * 32, transition_channels * 16)
+        # 20, 20, 512 => 20, 20, 256 => 40, 40, 256
+        self.conv_for_P5            = Conv(transition_channels * 16, transition_channels * 8)
+        # 40, 40, 1024 => 40, 40, 256
+        self.conv_for_feat2         = Conv(transition_channels * 32, transition_channels * 8)
+        # 40, 40, 512 => 40, 40, 256
+        self.conv3_for_upsample1    = Multi_Concat_Block(transition_channels * 16, panet_channels * 4, transition_channels * 8, e=e, n=n, ids=ids)
+
+        # 40, 40, 256 => 40, 40, 128 => 80, 80, 128
+        self.conv_for_P4            = Conv(transition_channels * 8, transition_channels * 4)
+        # 80, 80, 512 => 80, 80, 128
+        self.conv_for_feat1         = Conv(transition_channels * 16, transition_channels * 4)
+        # 80, 80, 256 => 80, 80, 128
+        self.conv3_for_upsample2    = Multi_Concat_Block(transition_channels * 8, panet_channels * 2, transition_channels * 4, e=e, n=n, ids=ids)
+
+        # 80, 80, 128 => 40, 40, 256
+        self.down_sample1           = Transition_Block(transition_channels * 4, transition_channels * 4)
+        # 40, 40, 512 => 40, 40, 256
+        self.conv3_for_downsample1  = Multi_Concat_Block(transition_channels * 16, panet_channels * 4, transition_channels * 8, e=e, n=n, ids=ids)
+
+        # 40, 40, 256 => 20, 20, 512
+        self.down_sample2           = Transition_Block(transition_channels * 8, transition_channels * 8)
+        # 20, 20, 1024 => 20, 20, 512
+        self.conv3_for_downsample2  = Multi_Concat_Block(transition_channels * 32, panet_channels * 8, transition_channels * 16, e=e, n=n, ids=ids)
+        #------------------------加强特征提取网络------------------------# 
+
+        # 80, 80, 128 => 80, 80, 256
+        self.rep_conv_1 = conv(transition_channels * 4, transition_channels * 8, 3, 1)
+        # 40, 40, 256 => 40, 40, 512
+        self.rep_conv_2 = conv(transition_channels * 8, transition_channels * 16, 3, 1)
+        # 20, 20, 512 => 20, 20, 1024
+        self.rep_conv_3 = conv(transition_channels * 16, transition_channels * 32, 3, 1)
+
+        # 4 + 1 + num_classes
+        # 80, 80, 256 => 80, 80, 3 * 25 (4 + 1 + 20) & 85 (4 + 1 + 80)
+        self.yolo_head_P3 = nn.Conv2d(transition_channels * 8, len(anchors_mask[2]) * (5 + 1 + num_classes), 1)
+        # 40, 40, 512 => 40, 40, 3 * 25 & 85
+        self.yolo_head_P4 = nn.Conv2d(transition_channels * 16, len(anchors_mask[1]) * (5 + 1 + num_classes), 1)
+        # 20, 20, 512 => 20, 20, 3 * 25 & 85
+        self.yolo_head_P5 = nn.Conv2d(transition_channels * 32, len(anchors_mask[0]) * (5 + 1 + num_classes), 1)
+
+    def fuse(self):
+        print('Fusing layers... ')
+        for m in self.modules():
+            if isinstance(m, RepConv):
+                m.fuse_repvgg_block()
+            elif type(m) is Conv and hasattr(m, 'bn'):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)
+                delattr(m, 'bn')
+                m.forward = m.fuseforward
+        return self
+    
+    def forward(self, x):
+        #  backbone
+        feat1, feat2, feat3 = self.backbone.forward(x)
+        
+        #------------------------加强特征提取网络------------------------# 
+        # 20, 20, 1024 => 20, 20, 512
+        P5          = self.sppcspc(feat3)
+        # 20, 20, 512 => 20, 20, 256
+        P5_conv     = self.conv_for_P5(P5)
+        # 20, 20, 256 => 40, 40, 256
+        P5_upsample = self.upsample(P5_conv)
+        # 40, 40, 256 cat 40, 40, 256 => 40, 40, 512
+        P4          = torch.cat([self.conv_for_feat2(feat2), P5_upsample], 1)
+        # 40, 40, 512 => 40, 40, 256
+        P4          = self.conv3_for_upsample1(P4)
+
+        # 40, 40, 256 => 40, 40, 128
+        P4_conv     = self.conv_for_P4(P4)
+        # 40, 40, 128 => 80, 80, 128
+        P4_upsample = self.upsample(P4_conv)
+        # 80, 80, 128 cat 80, 80, 128 => 80, 80, 256
+        P3          = torch.cat([self.conv_for_feat1(feat1), P4_upsample], 1)
+        # 80, 80, 256 => 80, 80, 128
+        P3          = self.conv3_for_upsample2(P3)
+
+        # 80, 80, 128 => 40, 40, 256
+        P3_downsample = self.down_sample1(P3)
+        # 40, 40, 256 cat 40, 40, 256 => 40, 40, 512
+        P4 = torch.cat([P3_downsample, P4], 1)
+        # 40, 40, 512 => 40, 40, 256
+        P4 = self.conv3_for_downsample1(P4)
+
+        # 40, 40, 256 => 20, 20, 512
+        P4_downsample = self.down_sample2(P4)
+        # 20, 20, 512 cat 20, 20, 512 => 20, 20, 1024
+        P5 = torch.cat([P4_downsample, P5], 1)
+        # 20, 20, 1024 => 20, 20, 512
+        P5 = self.conv3_for_downsample2(P5)
+        #------------------------加强特征提取网络------------------------# 
+        # P3 80, 80, 128 
+        # P4 40, 40, 256
+        # P5 20, 20, 512
+        
+        P3 = self.rep_conv_1(P3)
+        P4 = self.rep_conv_2(P4)
+        P5 = self.rep_conv_3(P5)
+        #---------------------------------------------------#
+        #   第三个特征层
+        #   y3=(batch_size, 75, 80, 80)
+        #---------------------------------------------------#
+        out2 = self.yolo_head_P3(P3)
+        #---------------------------------------------------#
+        #   第二个特征层
+        #   y2=(batch_size, 75, 40, 40)
+        #---------------------------------------------------#
+        out1 = self.yolo_head_P4(P4)
+        #---------------------------------------------------#
+        #   第一个特征层
+        #   y1=(batch_size, 75, 20, 20)
+        #---------------------------------------------------#
+        out0 = self.yolo_head_P5(P5)
+
+        return [out0, out1, out2]
